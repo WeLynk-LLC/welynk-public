@@ -27,7 +27,7 @@ This is not implementation documentation. You will find no code here. Instead, t
 5. [ALMA: Adaptive Learning Matching Algorithm](#5-alma-adaptive-learning-matching-algorithm)
 6. [Game Runtime Architecture](#6-game-runtime-architecture)
 7. [Game Physics and Client Interpolation](#7-game-physics-and-client-interpolation)
-8. [The Python-Node Bridge](#8-the-python-node-bridge)
+8. [Direct Connection Architecture](#8-direct-connection-architecture)
 9. [Game Security and Anti-Abuse](#9-game-security-and-anti-abuse)
 10. [Audio Control Enforcement](#10-audio-control-enforcement)
 11. [Authentication and Session Management](#11-authentication-and-session-management)
@@ -176,7 +176,6 @@ The agents in the system are:
 | SafetyAgent | Content moderation and minor protection |
 | MatchingAgent | ALMA user matching algorithm |
 | CallAgent | LiveKit voice/video coordination |
-| GameAgent | Game runtime bridge communication |
 | AuthorizationAgent | Role and permission management |
 | AnalyticsAgent | Metrics collection and aggregation |
 
@@ -1115,22 +1114,39 @@ SERVER-SIDE (@welynk/game-sdk):
 │    ctx.on('tick')           60Hz game loop (deltaTime)          │
 │    ctx.on('timer')          Timer fired                         │
 │    ctx.on('playerJoin')     Player joined                       │
-│    ctx.on('playerReady')    Player ready                        │
+│    ctx.on('playerReady')    Player ready (finished loading)     │
 │    ctx.on('playerLeave')    Player left (after grace)           │
 │    ctx.on('playerReconnect') Player reconnected within grace    │
+│    ctx.on('cleanup')        Session about to be destroyed       │
+│    ctx.on('hostChanged')    Host player changed                 │
+│    ctx.on('lobbyAutoUnlisted') Platform unlisted the session    │
 │                                                                 │
-│  APIs:                                                          │
-│    ctx.setState(state)      Update game state                   │
-│    ctx.broadcast(event)     Send event to all players           │
-│    ctx.reject(reason)       Reject current action               │
-│    ctx.Timer               Scheduled callbacks                  │
-│    ctx.Random              Seeded deterministic RNG             │
-│    ctx.Lynks               In-game currency operations          │
-│    ctx.PlayerData          Persistent player data               │
-│    ctx.Lobby               Lobby visibility controls            │
+│  State management:                                              │
+│    ctx.state                Current public state (read-only)    │
+│    ctx.setState(updates)    Update public state → syncs clients │
+│    ctx.serverState          Server-only state (never sent)      │
+│    ctx.setServerState(updates)  Update server-only state        │
+│    ctx.setStateFilter(fn)   Per-player state filtering          │
+│                                                                 │
+│  Communication:                                                 │
+│    ctx.broadcast(event, data)     Send to all players           │
+│    ctx.sendToPlayer(id, event, data) Send to specific player    │
+│    ctx.reject(reason)             Reject current action         │
+│                                                                 │
+│  Sub-APIs:                                                      │
+│    ctx.timer               Scheduled callbacks (start/cancel)   │
+│    ctx.random              Seeded deterministic RNG             │
+│    ctx.lynks               In-game currency operations          │
+│    ctx.ads                 Ad placement (rewarded, interstitial)│
+│    ctx.playerData          Persistent per-player storage        │
+│    ctx.lobby               Lobby visibility (list/unlist/close) │
+│                                                                 │
+│  Tick info (realtime games):                                    │
+│    ctx.tickNumber           Current tick number                 │
+│    ctx.gameTime             Seconds elapsed since start         │
 │                                                                 │
 │  Physics:                                                       │
-│    createWorld()            Planck.js physics world             │
+│    createWorld()            Physics world (Planck.js-based)     │
 │    world.addCircle()        Add circle body                     │
 │    world.addRectangle()     Add rectangle body                  │
 │    world.step(dt)           Advance physics simulation          │
@@ -1141,18 +1157,25 @@ SERVER-SIDE (@welynk/game-sdk):
 CLIENT-SIDE (@welynk/game-sdk/react):
 ┌─────────────────────────────────────────────────────────────────┐
 │  useGame<TState>()          Main hook for state and actions     │
-│    .state                   Current game state                  │
+│    .state                   Current game state (filtered)       │
 │    .players                 Player list                         │
-│    .myPlayer                Current player                      │
+│    .myPlayerId              This player's ID                    │
 │    .sendAction(action)      Send action to server               │
-│    .isConnected             Connection status                   │
+│    .requestLeave()          Request to leave game               │
+│    .gameStatus              Current game status                 │
+│                                                                 │
+│  useGameWithTiming<T>()     Like useGame + timing metadata      │
+│    .serverTime              Server timestamp from last update   │
+│    .tickNumber              Server tick number                  │
 │                                                                 │
 │  useGameEvent(name, cb)     Listen to server broadcasts         │
 │  useOptimisticValue()       Local prediction for responsive UI  │
+│  useSafeArea()              Device safe area insets             │
+│  useDiagnostics()           Network/frame diagnostic metrics    │
 │                                                                 │
 │  <Smooth>                   60fps rendering component           │
 │    - Bypasses React state batching                              │
-│    - Direct DOM manipulation                                    │
+│    - Direct DOM manipulation via entity interpolation           │
 │    - Selector extracts position: (state) => ({x, y, rotation})  │
 │                                                                 │
 │  useGameLoop(callback)      Direct render loop access           │
@@ -1160,6 +1183,7 @@ CLIENT-SIDE (@welynk/game-sdk/react):
 │                                                                 │
 │  useMusic(id)               Background music control            │
 │  useAudio(id)               Sound effect playback               │
+│  useAmbient(id)             Ambient/looping audio               │
 │  AudioProvider              Audio context management            │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
@@ -1463,16 +1487,16 @@ State update (server, 60Hz):
   ball.position += ball.velocity × (1/60)
 
 Client interpolation delay: [configured] (fast game requires low delay)
-Client prediction: enabled for local paddle only
+Client prediction: none (entity interpolation only, see Section 7.3)
 ```
 
 ---
 
-## 8. The Python-Node Bridge
+## 8. Direct Connection Architecture
 
 ### 8.1 Why Two Runtimes?
 
-WeLynk uses Python for business logic and Node.js for games. This separation is intentional:
+WeLynk uses Python for business logic and Node.js for game execution. This separation is intentional:
 
 | Concern | Python | Node.js |
 |---------|--------|---------|
@@ -1483,155 +1507,174 @@ WeLynk uses Python for business logic and Node.js for games. This separation is 
 | Game Development | Unusual | Natural fit |
 | Third-party Game SDKs | Rare | Abundant |
 
-The bridge connects these runtimes securely.
+Rather than routing all game traffic through Python, WeLynk uses a **Direct Connection** model where browsers connect directly to the Node.js game runtime. Python handles only lifecycle and economy operations through a separate control-plane channel.
 
-### 8.2 Bridge Architecture
+### 8.2 Direct Connection Model
 
 ```
+DIRECT CONNECTION ARCHITECTURE
+══════════════════════════════
+
 ┌─────────────────────────────────────────────────────────────────┐
-│                      PYTHON (user_backend)                      │
+│  BROWSER (Client)                                               │
 │                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │  MultiRuntimeBridge                                     │    │
-│  │                                                         │    │
-│  │  • Maintains WebSocket connection to Node runtime       │    │
-│  │  • Serializes/deserializes messages                     │    │
-│  │  • Routes game events to correct handler                │    │
-│  │  • Monitors connection health                           │    │
-│  │  • Handles reconnection on failure                      │    │
-│  └─────────────────────────────────────────────────────────┘    │
-│                              │                                  │
-└──────────────────────────────┼──────────────────────────────────┘
-                               │
-                               │ WebSocket (internal network)
-                               │ [internal port]
-                               │
-┌──────────────────────────────┼──────────────────────────────────┐
-│                              │                                  │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │  Bridge Endpoint                                        │    │
-│  │                                                         │    │
-│  │  • Accepts connection from Python                       │    │
-│  │  • Authenticates using shared secret                    │    │
-│  │  • Dispatches messages to game rooms                    │    │
-│  │  • Sends game events back to Python                     │    │
-│  └─────────────────────────────────────────────────────────┘    │
+│  ┌───────────────────────────────────────────────┐              │
+│  │  Game SDK (GameProvider)                       │              │
+│  │                                               │              │
+│  │  • Connects directly to game runtime via WS   │              │
+│  │  • Sends player actions                       │              │
+│  │  • Receives state snapshots at 30Hz           │              │
+│  │  • Handles reconnection with exponential      │              │
+│  │    backoff on disconnect                      │              │
+│  │  • Accepts token refresh from runtime         │              │
+│  └───────────────────────┬───────────────────────┘              │
+│                          │                                      │
+└──────────────────────────┼──────────────────────────────────────┘
+                           │
+                           │ Direct WebSocket
+                           │ /game/{sessionId}?token=xxx
+                           │ (JWT-authenticated)
+                           │
+┌──────────────────────────┼──────────────────────────────────────┐
+│                          │                                      │
+│  ┌───────────────────────▼───────────────────────┐              │
+│  │  Direct Connection Handler                     │              │
+│  │                                               │              │
+│  │  • Verifies JWT token on connect              │              │
+│  │  • Routes actions to correct game session     │              │
+│  │  • Streams state snapshots to client          │              │
+│  │  • Detects dead connections via ping/pong     │              │
+│  │  • Proactively refreshes tokens before expiry │              │
+│  └───────────────────────────────────────────────┘              │
 │                                                                 │
 │                      NODE.JS (game_runtime)                     │
+│                                                                 │
+│  ┌───────────────────────▲───────────────────────┐              │
+│  │  Control-Plane Handler (separate /ws endpoint) │              │
+│  │                                               │              │
+│  │  • Session create/destroy                     │              │
+│  │  • Player join/leave tracking                 │              │
+│  │  • Economy verification (Lynks)               │              │
+│  │  • Matchmaking coordination                   │              │
+│  └───────────────────────┬───────────────────────┘              │
+│                          │                                      │
+└──────────────────────────┼──────────────────────────────────────┘
+                           │
+                           │ Internal WebSocket (/ws)
+                           │ (shared-secret authenticated)
+                           │
+┌──────────────────────────┼──────────────────────────────────────┐
+│                          │                                      │
+│  ┌───────────────────────▼───────────────────────┐              │
+│  │  MultiRuntimeBridge                            │              │
+│  │                                               │              │
+│  │  • Sends lifecycle events to runtime          │              │
+│  │  • Receives game outcome events               │              │
+│  │  • Handles economy/Lynks verification         │              │
+│  │  • Monitors control-plane connection health   │              │
+│  └───────────────────────────────────────────────┘              │
+│                                                                 │
+│                      PYTHON (user_backend)                      │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 8.3 Message Protocol
+The key insight: **game traffic (actions, state snapshots, events) flows directly between browser and Node.js**, never touching Python. This eliminates a full network hop for every player action and state update, reducing latency and freeing Python to handle business logic.
 
-Messages between runtimes follow a strict format:
+### 8.3 Two Connection Types
 
 ```
-MESSAGE STRUCTURE
-═════════════════
+CONNECTION SEPARATION
+═════════════════════
 
-┌─────────────────────────────────────────────────────────────────┐
-│  {                                                              │
-│    "id": "msg_abc123",           // Unique message ID           │
-│    "type": "game_action",        // Message type                │
-│    "timestamp": 1706000000,      // Unix timestamp              │
-│    "payload": {                  // Type-specific data          │
-│      "room_id": "room_xyz",                                     │
-│      "user_id": "user_123",                                     │
-│      "action": "move",                                          │
-│      "data": {...}                                              │
-│    }                                                            │
-│  }                                                              │
-└─────────────────────────────────────────────────────────────────┘
+1. DIRECT CONNECTIONS (Browser ↔ Game Runtime)
+   ──────────────────────────────────────────
 
-MESSAGE TYPES
-═════════════
+   Purpose: Real-time game traffic
+   Auth: Short-lived JWT (generated by Python backend)
+   Traffic: Player actions, state snapshots, game events, broadcasts
+   Latency: Minimal (single hop)
 
-Python → Node:
-  • game_action     - Player action to process
-  • room_create     - Create new game room
-  • room_destroy    - Destroy game room
-  • player_join     - Add player to room
-  • player_leave    - Remove player from room
-  • ping            - Health check
+   Token lifecycle:
+     • Python generates game token on session join
+     • Browser presents token on WebSocket connect
+     • Runtime verifies token independently
+     • Runtime proactively refreshes token before expiry
+     • Client SDK handles token refresh transparently
 
-Node → Python:
-  • state_update    - Game state changed
-  • game_event      - Game-specific event
-  • room_status     - Room lifecycle event
-  • error           - Error occurred
-  • pong            - Health check response
+
+2. CONTROL-PLANE CONNECTION (Python ↔ Game Runtime)
+   ─────────────────────────────────────────────────
+
+   Purpose: Lifecycle and economy operations
+   Auth: Shared secret (internal network only)
+   Traffic: Session create/destroy, join/leave, Lynks verification
+
+   Control-plane messages (Python → Node):
+     • session_create    - Create new game session
+     • session_destroy   - Destroy game session
+     • player_join       - Register player in session
+     • player_leave      - Remove player from session
+     • lynks_result      - Economy transaction result
+     • ping              - Health check
+
+   Control-plane messages (Node → Python):
+     • game_ended        - Game finished (results/stats)
+     • lynks_request     - Economy transaction request
+     • player_data       - Persistent data operations
+     • room_status       - Room lifecycle event
+     • pong              - Health check response
 ```
 
 ### 8.4 Health Monitoring
 
-The bridge implements continuous health checking:
+Both connection types implement health checking:
 
 ```
-HEARTBEAT MECHANISM
-═══════════════════
+DIRECT CONNECTION HEALTH (Browser ↔ Runtime)
+════════════════════════════════════════════
 
-┌──────────────┐                              ┌──────────────┐
-│    Python    │                              │    Node.js   │
-└──────┬───────┘                              └──────┬───────┘
-       │                                             │
-       │  PING (t=0)                                 │
-       ├────────────────────────────────────────────▶│
-       │                                             │
-       │                              PONG (t=Xms)   │
-       │◀────────────────────────────────────────────┤
-       │                                             │
-       │  RTT = Xms, connection healthy              │
-       │                                             │
-       │  PING (t=N)                                 │
-       ├────────────────────────────────────────────▶│
-       │                                             │
-       │  ... no response for timeout ...             │
-       │                                             │
-       │  Connection unhealthy!                      │
-       │  Attempt reconnection                       │
-       │                                             │
+Runtime periodically pings each browser connection:
+  • WebSocket ping/pong at configured interval
+  • Connections not responding are marked dead
+  • Dead connections trigger player leave (with grace period)
+  • Prevents ghost players from stale connections
 
-Health check parameters:
-  [Specific values redacted for security]
-  Includes: ping interval, timeout, max retries, retry delay
+CONTROL-PLANE HEALTH (Python ↔ Runtime)
+═══════════════════════════════════════
+
+Python periodically pings the runtime:
+
+  Health check parameters:
+    [Specific values redacted for security]
+    Includes: ping interval, timeout, max retries, retry delay
 ```
 
 ### 8.5 Reconnection Logic
 
-When the bridge connection fails:
-
 ```
-RECONNECTION STATE MACHINE
-══════════════════════════
+CLIENT RECONNECTION (Browser → Runtime)
+═══════════════════════════════════════
 
-          ┌──────────────┐
-          │  CONNECTED   │
-          └──────┬───────┘
-                 │ connection lost
-                 ▼
-          ┌──────────────┐
-    ┌────▶│  RECONNECTING│◀───┐
-    │     └──────┬───────┘    │
-    │            │            │
-    │  timeout   │ success    │ failure
-    │ (configured)│           │ (retry < max)
-    │            ▼            │
-    │     ┌──────────────┐    │
-    │     │  CONNECTED   │    │
-    │     └──────────────┘    │
-    │                         │
-    │                         │
-    ▼                         │
-┌──────────────┐              │
-│   FAILED     │──────────────┘
-│ (alert ops)  │  manual restart
-└──────────────┘
+On WebSocket disconnect (unintentional):
+  1. Client SDK detects connection loss
+  2. Exponential backoff reconnection begins
+     • Base delay: [configured]
+     • Max delay: [configured]
+     • Max attempts: [configured]
+  3. On reconnect: token re-verified, state resynced
+  4. Player appears to never have left (if within grace period)
+
+On intentional close (game end, leave):
+  • No reconnection attempted
+
+
+CONTROL-PLANE RECONNECTION (Python ↔ Runtime)
+═════════════════════════════════════════════
 
 During RECONNECTING:
-  • Control-plane game events (join/leave/clock sync) are queued
-  • Clients receive "reconnecting" status
+  • Control-plane events (join/leave/clock sync) are queued
   • No new games can be started
-  • Direct runtime gameplay continues independently of backend control-plane
+  • Direct runtime gameplay continues independently
 
 On successful reconnection:
   • Queued control-plane events are replayed in order
@@ -1684,7 +1727,8 @@ ISOLATION LAYERS
 │                                                                 │
 │  Game runtime runs on isolated Docker network                   │
 │  ALLOWED connections:                                           │
-│    • user_backend (bridge only)                                 │
+│    • user_backend (control-plane WebSocket)                     │
+│    • Browser clients (direct game WebSocket, token-auth)        │
 │  BLOCKED connections:                                           │
 │    • Database (PostgreSQL)                                      │
 │    • Cache (Redis)                                              │
@@ -2327,42 +2371,62 @@ After a match:
 
 ### 13.1 Status State Machine
 
+WeLynk separates **presence status** (connection state) from **activity status** (what the user is doing):
+
 ```
-PRESENCE STATES
-═══════════════
+PRESENCE STATES (Connection-Based)
+══════════════════════════════════
 
 ┌──────────────────────────────────────────────────────────────────┐
 │                                                                  │
-│    ┌──────────┐                               ┌──────────┐       │
-│    │  ONLINE  │◀────────────────────────────▶│   IDLE   │       │
-│    └────┬─────┘     inactivity timeout         └────┬─────┘       │
-│         │                                          │             │
-│         │ user sets                                │ user sets   │
-│         │ manually                                 │ manually    │
-│         │                                          │             │
-│         ▼                                          ▼             │
-│    ┌──────────┐                               ┌──────────┐       │
-│    │   DND    │                               │INVISIBLE │       │
-│    └────┬─────┘                               └────┬─────┘       │
-│         │                                          │             │
-│         │                                          │             │
-│         └─────────────────┬────────────────────────┘             │
+│    ┌──────────┐    start searching     ┌────────────┐            │
+│    │  ONLINE  │──────────────────────▶│ SEARCHING  │            │
+│    └────┬─────┘◀──────────────────────└────────────┘            │
+│         │         stop searching                                 │
+│         │                                                        │
+│         │ join call                                               │
+│         ▼                                                        │
+│    ┌──────────┐                                                  │
+│    │ IN_CALL  │                                                  │
+│    └────┬─────┘                                                  │
+│         │ leave call                                              │
+│         │                                                        │
+│         └─────────────────┬──────────────────────────────────────│
 │                           │                                      │
 │                           │ disconnect                           │
-│                           │ (configurable grace period)          │
 │                           ▼                                      │
-│                      ┌──────────┐                                │
-│                      │ OFFLINE  │                                │
+│                    ┌──────────────┐                               │
+│                    │ GRACE_PERIOD │  (still appears online)       │
+│                    └──────┬───────┘                               │
+│                           │                                      │
+│              reconnect    │    grace expires                      │
+│              ┌────────────┤                                      │
+│              │            ▼                                      │
+│              │       ┌──────────┐                                │
+│              └──────▶│ OFFLINE  │                                │
 │                      └──────────┘                                │
 │                                                                  │
 └──────────────────────────────────────────────────────────────────┘
 
-Status definitions:
-  ONLINE    - User active via WebSocket (marked in Redis sorted set)
-  IDLE      - Based on activity updates (game/call state)
-  DND       - Do not disturb (managed via custom status)
-  INVISIBLE - Privacy setting to hide online status
-  OFFLINE   - Not connected
+Presence status definitions:
+  ONLINE       - Connected via WebSocket
+  SEARCHING    - Actively searching for a match
+  IN_CALL      - Currently in a voice/video call
+  GRACE_PERIOD - Disconnected but still appearing online
+  OFFLINE      - Not connected (grace period expired)
+
+
+ACTIVITY STATES (What the User is Doing)
+════════════════════════════════════════
+
+  IDLE      - Online but inactive
+  ACTIVE    - Actively using the app
+  IN_GAME   - Playing a game
+  IN_CHAT   - Viewing a chat
+  IN_CALL   - In a voice/video call
+
+Activity status is derived from user actions (sending messages,
+playing games, etc.) and is independent of presence status.
 ```
 
 ### 13.2 Presence Architecture
@@ -2467,9 +2531,9 @@ Who sees whose presence:
   • Game players see each other during game
 
 Privacy Rules:
-  • INVISIBLE users appear OFFLINE to all
   • Blocked users never see each other's presence
   • Minors' presence visible only to friends
+  • Mutual privacy settings control visibility (see 13.3)
 
 Subscription limits:
   • Max presence subscriptions per user (configured limit)
