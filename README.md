@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  Chat, calls, games, and discovery—all in one place, built with safety first.
+  Chat, calls, games, and discovery, all in one place, built with safety first.
 </p>
 
 <p align="center">
@@ -20,11 +20,17 @@
 
 ---
 
-## About
+## About this repository
 
-WeLynk is a social platform designed to help people connect meaningfully. We combine chat, voice/video calls, multiplayer games, and smart discovery features into a single experience—with safety and privacy at the core of everything we build.
+**The WeLynk production code is closed source.** This repository holds the public documentation for the platform: the legal policies, the architecture and safety design, and the developer-facing notes. It exists so that anyone evaluating WeLynk, or evaluating the engineering behind it, can read how the system is built without access to the source.
 
-**Our Promise:** We will never sell your data.
+WeLynk is built and operated by [Omar Walweel](https://getwelynk.com) through WeLynk LLC. Last updated: 2026-08-22.
+
+## About WeLynk
+
+WeLynk is a social platform designed to help people connect meaningfully. It combines chat, voice and video calls, multiplayer games, and matching into a single experience, with safety and privacy at the core of everything in it.
+
+**The promise:** WeLynk will never sell your data.
 
 ---
 
@@ -57,18 +63,18 @@ WeLynk is a social platform designed to help people connect meaningfully. We com
 
 | Document | Description |
 |----------|-------------|
-| [Games SDK](docs/developer/GamesSDK.md) | Build multiplayer games for WeLynk (Coming Soon) |
+| [Games SDK](docs/developer/GamesSDK.md) | Notes on building multiplayer games for WeLynk |
 
 ---
 
 ## Safety & Compliance
 
-WeLynk is designed for users aged 16 and above, with enhanced protections for users under 18. We maintain compliance with:
+New WeLynk accounts require users to be 18 or older. A small number of earlier accounts aged 16 to 17 remain, with enhanced protections and without access to matching. The platform maintains compliance with:
 
-- **COPPA** — Children's Online Privacy Protection Act
-- **GDPR** — General Data Protection Regulation
-- **CCPA** — California Consumer Privacy Act
-- **CSAM Detection** — Automated detection with NCMEC reporting
+- **COPPA**: Children's Online Privacy Protection Act
+- **GDPR**: General Data Protection Regulation
+- **CCPA**: California Consumer Privacy Act
+- **CSAM detection**: automated detection (Microsoft PhotoDNA) with NCMEC reporting
 
 ---
 
@@ -79,6 +85,7 @@ WeLynk is designed for users aged 16 and above, with enhanced protections for us
 | General Support | support@welynk.com |
 | Legal Inquiries | legal@welynk.com |
 | Business | business@welynk.com |
+| Contract and white-label engineering | [getwelynk.com](https://getwelynk.com) |
 
 ---
 
